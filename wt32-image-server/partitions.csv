@@ -1,0 +1,8 @@
+# No-OTA layout for the WT32-SC01 (4 MB flash): one factory app + a large
+# LittleFS data partition to hold the 4 full-screen raw slots (4 x 300 KB) with
+# room to spare. We flash over USB, so OTA isn't needed.
+# Name,     Type, SubType,  Offset,   Size
+nvs,        data, nvs,      0x9000,   0x6000
+factory,    app,  factory,  0x10000,  0x180000
+spiffs,     data, spiffs,   0x190000, 0x250000
+coredump,   data, coredump, 0x3E0000, 0x10000
