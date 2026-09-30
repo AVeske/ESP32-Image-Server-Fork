@@ -20,6 +20,7 @@
 #include <M5Unified.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <LittleFS.h>
@@ -27,6 +28,9 @@
 #include "names_discovery.h"
 #include "overlay.h"
 #include "index_html.h"
+#include "letter_selector.h"
+#include "letter_sender.h"
+#include <HTTPClient.h>
 
 static const uint16_t FRAME_W = 128;
 static const uint16_t FRAME_H = 128;
@@ -36,6 +40,8 @@ static const int   NUM_SLOTS = 4;
 static const int   GESTURES  = 3;            // short / long / double per slot
 static const char* BUTTONS_PATH = "/buttons.txt";
 static String slotPath(int n) { return "/" + String(n) + ".bin"; }
+
+static const char* STATION_URL = "http://192.168.4.2:5000";
 
 // Single-button gesture thresholds.
 static const uint32_t SHORT_MAX_MS = 500;    // release before this = short click
@@ -57,10 +63,12 @@ static const uint32_t STA_TIMEOUT_MS = 20000;  // give up on a join after this
 
 WebServer server(80);
 Preferences prefs;
+DNSServer dnsServer;
 
 static uint8_t frameBuf[FRAME_BYTES];
 static size_t  frameLen = 0;     // bytes received so far in the current upload
 static bool    frameOk  = false; // a full frame is currently stored/displayed
+static bool    letterMode = false;
 static int     markerId = -1;    // ArUco id of the current slot (-1 = unknown)
 static int     curSlot  = 0;
 static bool    slotFilled[NUM_SLOTS] = { false };
@@ -81,6 +89,7 @@ static bool apActive() {
 // order to the panel's native order itself (reading it as a plain uint16
 // rotates the channels: red->blue, green->red, blue->green).
 static void pushFrame() {
+  if (letterMode) return;
   M5.Display.startWrite();
   M5.Display.pushImage(0, 0, FRAME_W, FRAME_H, (const m5gfx::swap565_t*)frameBuf);
   M5.Display.endWrite();
@@ -116,6 +125,7 @@ static bool loadSlot(int n) {
   curSlot = n;
   frameOk = true;
   prefs.putInt("slot", curSlot);
+  letterMode = false;
   pushFrame();
   return true;
 }
@@ -205,6 +215,7 @@ static int batteryPercent(int mv) {
 
 // ---- on-screen status ------------------------------------------------------
 static void showStatus() {
+  if (letterMode) return;
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
   M5.Display.setTextSize(1);
@@ -232,8 +243,13 @@ static void showStatus() {
 // Repaint whatever should currently be on the panel. Called after an overlay
 // change, since the labels/bars are drawn over the image rather than into it.
 static void redraw() {
-  if (frameOk) pushFrame();   // pushFrame() draws the overlay itself
-  else showStatus();
+  if (letterMode) {
+    showSelectedLetter();
+  } else if (frameOk) {
+    pushFrame();
+  } else {
+    showStatus();
+  }
 }
 
 // ---- serial reporting ------------------------------------------------------
@@ -266,6 +282,9 @@ static void startAP() {
   staConnecting = false;
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
+
+  dnsServer.start(53, "*", WiFi.softAPIP());
+
   Serial.printf("SoftAP \"%s\"  http://%s/\n", AP_SSID, WiFi.softAPIP().toString().c_str());
   if (!frameOk) showStatus();  // keep a restored frame on screen; status is on the button
 }
@@ -369,26 +388,38 @@ static void runGesture(int g) {
 // short release is held back until the double-click window passes (so it can
 // become a double instead); a 500–1500 ms release is in neither band, ignored.
 static void pumpButton() {
-  if (M5.BtnA.wasPressed())  pressStart = millis();
-  if (M5.BtnA.wasReleased()) {
-    uint32_t dur = millis() - pressStart;
-    if (dur >= LONG_MIN_MS) {
-      shortPending = false;
-      runGesture(1);                                   // long
-    } else if (dur < SHORT_MAX_MS) {
-      if (shortPending && (millis() - firstShortAt) <= DOUBLE_MS) {
-        shortPending = false;
-        runGesture(2);                                 // double
-      } else {
-        shortPending = true;
-        firstShortAt = millis();
-      }
+  if (M5.BtnA.wasPressed()) {
+    pressStart = millis();
+    Serial.println("BtnA pressed");
+  }
+
+  if (!M5.BtnA.wasReleased()) return;
+
+  uint32_t duration = millis() - pressStart;
+  Serial.printf("BtnA released: %lu ms\n", (unsigned long)duration);
+
+  if (duration >= LONG_MIN_MS) {
+    letterMode = false;
+    redraw();
+    char letter = getSelectedLetter();
+
+    bool sent = sendLetter(STATION_URL, letter);
+
+    if (sent) {
+      Serial.printf("Letter %c sent successfully\n", letter);
+    } else {
+      Serial.printf("Failed to send letter %c\n", letter);
     }
   }
-  if (shortPending && (millis() - firstShortAt) > DOUBLE_MS) {
-    shortPending = false;
-    runGesture(0);                                     // single short
+
+  // Esimene vajutus kuvab A; järgmised valivad järgmise tähe.
+  if (letterMode) {
+    nextLetter();
   }
+
+  letterMode = true;
+  showSelectedLetter();
+  Serial.printf("Selected letter: %c\n", getSelectedLetter());
 }
 
 // ---- HTTP handlers ---------------------------------------------------------
@@ -517,10 +548,24 @@ static void handleNamePost() {
   server.send(200, "text/plain", disco::name());
 }
 
+static void handleNotFound() {
+  String url = "http://" + WiFi.softAPIP().toString() + "/";
+  server.sendHeader("Location", url);
+  server.send(302, "text/plain", "");
+}
+
+static void handleTestDisplay(){
+  letterMode = false;
+  showStatus();
+  server.send(200, "text/plain", "Status shown on display");
+}
+
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Display.setRotation(0);
+
+  initLetterSelector();
 
   // Battery ADC: 12-bit, 2:1 divider on GPIO 8 (see batteryMilliVolts()).
   pinMode(BAT_ADC_PIN, INPUT);
@@ -558,6 +603,8 @@ void setup() {
   server.on("/frame", HTTP_GET, handleFrameGet);
   // POST /frame: (responder, upload-handler) — the upload handler fires first.
   server.on("/frame", HTTP_POST, handleFrameDone, handleFrameUpload);
+  server.on("/test-display", HTTP_GET, handleTestDisplay);
+  server.onNotFound(handleNotFound);
   server.begin();
 
   Serial.println();
@@ -567,6 +614,7 @@ void setup() {
 
 void loop() {
   M5.update();
+  dnsServer.processNextRequest();
   server.handleClient();
   pumpSerial();
   pollSTA();

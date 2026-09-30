@@ -177,6 +177,20 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
 
     <div class="div"></div>
 
+    <div class="div"></div>
+
+    <div class="group">
+      <span class="label">Lab settings</span>
+
+      <div class="hint2">
+        WiFi: <b id="wifiName">AtomFramer</b>
+      </div>
+
+      <button id="testDisplay">TEST DISPLAY</button>
+
+      <div class="status" id="labStatus"></div>
+    </div>
+
     <div class="group">
       <span class="label">Network — I am <b id="devName" style="color:var(--hot)">…</b></span>
       <div id="peers" class="peers"><span class="hint2">discovering…</span></div>
@@ -648,6 +662,27 @@ async function showOnDevice(){
     setStatus(r.ok ? 'Showing slot '+(activeSlot+1)+' on device.' : 'Slot '+(activeSlot+1)+' is empty — send an image first.', r.ok?'ok':'err');
   }catch(e){ setStatus('Show failed — page must be served by the device.', 'err'); }
 }
+
+document.getElementById('testDisplay').onclick = async ()=>{
+  const out = document.getElementById('labStatus');
+
+  try {
+    const response = await fetch('/test-display');
+    const text = await response.text();
+
+    if (response.ok) {
+      out.textContent = text;
+      out.className = 'status ok';
+    } else {
+      out.textContent = 'Test failed: HTTP ' + response.status;
+      out.className = 'status err';
+    }
+  } catch (error) {
+    out.textContent = 'Could not reach Atom.';
+    out.className = 'status err';
+  }
+};
+
 document.getElementById('saveBtns').onclick = saveGestures;
 document.getElementById('showDev').onclick = showOnDevice;
 
