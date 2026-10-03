@@ -3,7 +3,14 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 
-bool sendLetter(const String& stationUrl, char letter) {
+static String letterPayload(char letter) {
+  String body = "{\"letter\":\"";
+  body += letter;
+  body += "\"}";
+  return body;
+}
+
+static bool sendLetterWifi(const String& stationUrl, char letter) {
 
   HTTPClient http;
 
@@ -12,9 +19,7 @@ bool sendLetter(const String& stationUrl, char letter) {
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
 
-  String body = "{\"letter\":\"";
-  body += letter;
-  body += "\"}";
+  String body = letterPayload(letter);
 
   Serial.print("Sending letter to: ");
   Serial.println(url);
@@ -41,4 +46,23 @@ bool sendLetter(const String& stationUrl, char letter) {
   http.end();
 
   return statusCode >= 200 && statusCode < 300;
+}
+
+// The COM port is shared with the debug log, so the payload goes out as a line
+// of its own — the station picks out the lines starting with {"letter".
+static bool sendLetterSerial(char letter) {
+  String body = letterPayload(letter);
+
+  size_t written = Serial.println(body);
+  Serial.flush();
+
+  return written >= body.length();
+}
+
+bool sendLetter(const String& stationUrl, char letter) {
+  if (LETTER_TRANSPORT == LetterTransport::SERIAL_PORT) {
+    return sendLetterSerial(letter);
+  }
+
+  return sendLetterWifi(stationUrl, letter);
 }

@@ -41,7 +41,7 @@ static const int   GESTURES  = 3;            // short / long / double per slot
 static const char* BUTTONS_PATH = "/buttons.txt";
 static String slotPath(int n) { return "/" + String(n) + ".bin"; }
 
-static const char* STATION_URL = "http://192.168.4.2:5000";
+static const char* STATION_URL = "http://192.168.4.2:8000";
 
 // Single-button gesture thresholds.
 static const uint32_t SHORT_MAX_MS = 500;    // release before this = short click
