@@ -7,7 +7,7 @@ bool sendLetter(const String& stationUrl, char letter) {
 
   HTTPClient http;
 
-  String url = stationUrl + "/letter";
+  String url = stationUrl + "/api/letter";
 
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
