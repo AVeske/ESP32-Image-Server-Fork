@@ -32,6 +32,7 @@
 #include "letter_sender.h"
 #include <HTTPClient.h>
 
+#include "server_client.h"
 #include "secrets.h"
 
 static const uint16_t FRAME_W = 128;
@@ -76,6 +77,11 @@ static int     curSlot  = 0;
 static bool    slotFilled[NUM_SLOTS] = { false };
 
 static String  lineBuf;          // serial line accumulator
+static String pendingPass;
+static bool staEnabled = false;
+static bool triedSecretsFallback = false;
+static uint32_t nextStaRetry = 0;
+static const uint32_t STA_RETRY_MS = 10000;
 static String  pendingSsid;      // ssid we're currently trying to join
 static bool    staConnecting = false;
 static uint32_t staDeadline = 0;
@@ -280,9 +286,10 @@ static void printHelp() {
 }
 
 // ---- WiFi mode control -----------------------------------------------------
-static void startAP() {
+static void startAP(bool keepStation = false) {
   staConnecting = false;
-  WiFi.mode(WIFI_AP);
+  if (!keepStation) staEnabled = false;
+  WiFi.mode(keepStation ? WIFI_AP_STA : WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
 
   dnsServer.start(53, "*", WiFi.softAPIP());
@@ -297,28 +304,108 @@ static void startSTA(const String& ssid, const String& pass, bool save) {
     prefs.putString("pass", pass);
   }
   pendingSsid = ssid;
-  WiFi.mode(WIFI_STA);
+  pendingPass = pass;
+  staEnabled = true;
+  WiFi.mode(apActive() ? WIFI_AP_STA : WIFI_STA);
   WiFi.setAutoReconnect(true);    // rejoin automatically after a WiFi-infra swap
-  WiFi.begin(ssid.c_str(), pass.c_str());
+  if (pass.length() == 0) {
+
+    WiFi.begin(
+        ssid.c_str()
+    );
+
+} else {
+
+    WiFi.begin(
+        ssid.c_str(),
+        pass.c_str()
+    );
+}
   staConnecting = true;
   staDeadline = millis() + STA_TIMEOUT_MS;
-  Serial.printf("joining \"%s\"... (waiting for DHCP)\n", ssid.c_str());
   if (!frameOk) showStatus();  // keep a restored frame on screen; status is on the button
 }
 
 // Watch a pending STA join; report the IP once DHCP lands, or fall back to AP.
 static void pollSTA() {
-  if (!staConnecting) return;
-  if (WiFi.status() == WL_CONNECTED) {
-    staConnecting = false;
-    Serial.println("connected.");
-    reportIP();
-    if (frameOk) pushFrame(); else showStatus();  // don't wipe a restored frame
-  } else if ((int32_t)(millis() - staDeadline) >= 0) {
-    staConnecting = false;
-    Serial.println("join timed out — starting SoftAP.");
-    startAP();
-  }
+
+    if (!staEnabled) return;
+    if (!staConnecting) {
+        if (WiFi.status() == WL_CONNECTED) {
+            nextStaRetry = 0;
+            return;
+        }
+        if (nextStaRetry == 0) {
+            nextStaRetry = millis() + STA_RETRY_MS;
+            Serial.println("[WiFi] Disconnected; retrying in 10 seconds.");
+        }
+        if ((int32_t)(millis() - nextStaRetry) < 0) return;
+        nextStaRetry = 0;
+        Serial.println("[WiFi] Retrying station connection.");
+        startSTA(pendingSsid, pendingPass, false);
+        return;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+
+        staConnecting = false;
+        // Keep the credentials that actually worked for the next boot.
+        prefs.putString("ssid", pendingSsid);
+        prefs.putString("pass", pendingPass);
+
+        static bool connectionReported = false;
+        if (!connectionReported) {
+            Serial.printf("WiFi connected: %s | IP: %s\n",
+                          WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+            connectionReported = true;
+        }
+
+        if (frameOk) {
+            pushFrame();
+        } else {
+            showStatus();
+        }
+
+    } else if ((int32_t)(millis() - staDeadline) >= 0) {
+
+        staConnecting = false;
+
+        Serial.println();
+        Serial.println("===== WIFI CONNECTION FAILED =====");
+
+        Serial.printf(
+            "SSID: %s\n",
+            pendingSsid.c_str()
+        );
+
+        Serial.printf(
+            "Final WiFi status: %d\n",
+            WiFi.status()
+        );
+
+        Serial.println(
+            "Timed out after 20 seconds."
+        );
+
+        Serial.println(
+            "Starting AtomFramer AP."
+        );
+
+        Serial.println(
+            "=================================="
+        );
+
+        if (!triedSecretsFallback && strlen(WIFI_SSID) > 0 &&
+            (pendingSsid != WIFI_SSID || pendingPass != WIFI_PASSWORD)) {
+            triedSecretsFallback = true;
+            Serial.println("[WiFi] Saved credentials failed; trying secrets.h credentials.");
+            startSTA(String(WIFI_SSID), String(WIFI_PASSWORD), false);
+            return;
+        }
+        startAP(true);
+        nextStaRetry = millis() + STA_RETRY_MS;
+        Serial.println("[WiFi] AP available; station retry in 10 seconds.");
+    }
 }
 
 // ---- serial command parsing ------------------------------------------------
@@ -575,6 +662,12 @@ void setup() {
 
   Serial.begin(115200);
   prefs.begin("wifi", false);
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      Serial.printf("[WiFi] Station disconnected: reason=%u\n",
+                    info.wifi_sta_disconnected.reason);
+    }
+  });
 
   // Mount flash and restore the last-shown slot immediately, so the panel comes
   // straight up on its page — no boot animation, no status screen, no WiFi wait.
@@ -587,8 +680,33 @@ void setup() {
   // Bring WiFi up FIRST — this initialises the lwIP/TCP-IP stack. Starting the
   // web server before any WiFi.mode() call asserts "Invalid mbox" in lwIP.
   String savedSsid = prefs.getString("ssid", "");
-  if (savedSsid.length()) startSTA(savedSsid, prefs.getString("pass", ""), false);
-  else startAP();
+
+  if (savedSsid.length()) {
+
+    startSTA(
+        savedSsid,
+        prefs.getString("pass", ""),
+        false
+    );
+
+  } else if (strlen(WIFI_SSID) > 0) {
+
+      startSTA(
+          String(WIFI_SSID),
+          String(WIFI_PASSWORD),
+          true
+      );
+
+  } else {
+
+      Serial.println(
+          "No WiFi credentials available -> starting AP only"
+      );
+
+      startAP();
+  }
+
+  initServerClient();
 
   disco::begin();   // random name (persisted) + UDP discovery, after WiFi is up
 
@@ -611,15 +729,24 @@ void setup() {
 
   Serial.println();
   Serial.printf("ATOM FRAMER ready — name \"%s\".\n", disco::name().c_str());
-  printHelp();
 }
 
 void loop() {
   M5.update();
-  dnsServer.processNextRequest();
+  if (apActive()) dnsServer.processNextRequest();
   server.handleClient();
   pumpSerial();
   pollSTA();
-  disco::loop();   // UDP announce + peer table upkeep
+  pollServer();
+  // Network transitions invalidate UDP sockets; bind again once an IP exists.
+  static IPAddress discoveryIP;
+  IPAddress currentIP = WiFi.status() == WL_CONNECTED ? WiFi.localIP()
+                         : (apActive() ? WiFi.softAPIP() : IPAddress());
+  if (currentIP != discoveryIP) {
+    disco::_udp.stop();
+    if ((uint32_t)currentIP != 0) disco::_udp.begin(disco::PORT);
+    discoveryIP = currentIP;
+  }
+  if ((uint32_t)currentIP != 0) disco::loop();
   pumpButton();    // short / long / double click -> the current slot's actions
 }
