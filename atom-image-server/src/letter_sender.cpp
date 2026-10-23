@@ -3,23 +3,27 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 
-static String letterPayload(char letter) {
+static String letterPayload(char letter, int jobId = -1) {
   String body = "{\"letter\":\"";
   body += letter;
-  body += "\"}";
+  body += "\"";
+  if (jobId >= 0) body += ",\"id\":" + String(jobId);
+  body += "}";
   return body;
 }
 
-static bool sendLetterWifi(const String& stationUrl, char letter) {
+static bool sendLetterWifi(const String& stationUrl, char letter, int jobId) {
 
   HTTPClient http;
 
   String url = stationUrl + "/api/letter";
 
-  http.begin(url);
+  http.setConnectTimeout(2000);
+  http.setTimeout(3000);
+  if (!http.begin(url)) return false;
   http.addHeader("Content-Type", "application/json");
 
-  String body = letterPayload(letter);
+  String body = letterPayload(letter, jobId);
 
   Serial.print("Sending letter to: ");
   Serial.println(url);
@@ -31,7 +35,7 @@ static bool sendLetterWifi(const String& stationUrl, char letter) {
 
   if (statusCode <= 0) {
     Serial.print("HTTP POST failed: ");
-    Serial.println(statusCode);
+    Serial.printf("%d (%s)\n", statusCode, http.errorToString(statusCode).c_str());
 
     http.end();
     return false;
@@ -59,10 +63,10 @@ static bool sendLetterSerial(char letter) {
   return written >= body.length();
 }
 
-bool sendLetter(const String& stationUrl, char letter) {
-  if (LETTER_TRANSPORT == LetterTransport::SERIAL_PORT) {
+bool sendLetter(const String& stationUrl, char letter, LetterTransport transport, int jobId) {
+  if (transport == LetterTransport::SERIAL_PORT) {
     return sendLetterSerial(letter);
   }
 
-  return sendLetterWifi(stationUrl, letter);
+  return sendLetterWifi(stationUrl, letter, jobId);
 }

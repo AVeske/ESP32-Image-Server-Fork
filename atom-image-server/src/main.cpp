@@ -33,6 +33,7 @@
 #include <HTTPClient.h>
 
 #include "server_client.h"
+#include <ArduinoJson.h>
 #include "secrets.h"
 
 static const uint16_t FRAME_W = 128;
@@ -292,6 +293,7 @@ static void startAP(bool keepStation = false) {
   WiFi.mode(keepStation ? WIFI_AP_STA : WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
 
+  dnsServer.stop();
   dnsServer.start(53, "*", WiFi.softAPIP());
 
   Serial.printf("SoftAP \"%s\"  http://%s/\n", AP_SSID, WiFi.softAPIP().toString().c_str());
@@ -306,7 +308,9 @@ static void startSTA(const String& ssid, const String& pass, bool save) {
   pendingSsid = ssid;
   pendingPass = pass;
   staEnabled = true;
-  WiFi.mode(apActive() ? WIFI_AP_STA : WIFI_STA);
+  // Keep the laptop/station network available while STA provides internet.
+  if (!apActive()) startAP(true);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.setAutoReconnect(true);    // rejoin automatically after a WiFi-infra swap
   if (pass.length() == 0) {
 
@@ -473,9 +477,8 @@ static void runGesture(int g) {
   else if (g == 1) showStatus();
 }
 
-// Classify BtnA press/release timing into short / long / double and fire it. A
-// short release is held back until the double-click window passes (so it can
-// become a double instead); a 500–1500 ms release is in neither band, ignored.
+// Short releases select A-Z; long releases enqueue the selected letter.
+// All station HTTP runs in the worker so button sampling remains responsive.
 static void pumpButton() {
   if (M5.BtnA.wasPressed()) {
     pressStart = millis();
@@ -488,17 +491,13 @@ static void pumpButton() {
   Serial.printf("BtnA released: %lu ms\n", (unsigned long)duration);
 
   if (duration >= LONG_MIN_MS) {
-    letterMode = false;
-    redraw();
     char letter = getSelectedLetter();
-
-    bool sent = sendLetter(STATION_URL, letter);
-
-    if (sent) {
-      Serial.printf("Letter %c sent successfully\n", letter);
-    } else {
-      Serial.printf("Failed to send letter %c\n", letter);
-    }
+    bool queued = queueStationLetter(letter);
+    Serial.printf("Letter %c: %s\n", letter, queued ? "queued for station" : "send queue unavailable");
+    // Long press sends the selected letter; it must not advance the alphabet.
+    letterMode = true;
+    showSelectedLetter();
+    return;
   }
 
   // Esimene vajutus kuvab A; järgmised valivad järgmise tähe.
@@ -512,7 +511,22 @@ static void pumpButton() {
 }
 
 // ---- HTTP handlers ---------------------------------------------------------
+static void handlePortalRedirect() {
+  String url = "http://" + WiFi.softAPIP().toString() + "/";
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.sendHeader("Location", url, true);
+  server.send(302, "text/plain", "Open " + url);
+}
+
 static void handleRoot() {
+  // Canonical numeric URL avoids keeping a connectivity-check hostname open.
+  String host = server.hostHeader();
+  String localIP = server.client().localIP().toString();
+  if (apActive() && host.length() && host != localIP && host != localIP + ":80") {
+    handlePortalRedirect();
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store");
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
@@ -638,9 +652,27 @@ static void handleNamePost() {
 }
 
 static void handleNotFound() {
-  String url = "http://" + WiFi.softAPIP().toString() + "/";
-  server.sendHeader("Location", url);
-  server.send(302, "text/plain", "");
+  if (apActive() && server.method() == HTTP_GET) handlePortalRedirect();
+  else server.send(404, "text/plain", "Not found");
+}
+
+static void handleStationResult() {
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain")) || !doc["id"].is<int>() ||
+      doc["id"].as<int>() < 0 || !doc["result"].is<const char*>()) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid result payload\"}");
+    return;
+  }
+  const char* result = doc["result"];
+  if (strcmp(result, "done") && strcmp(result, "error")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Expected done or error\"}");
+    return;
+  }
+  int state = queueStationResult(doc["id"].as<int>(), result);
+  // The station retries until public Flask has actually confirmed delivery.
+  if (state == 1) server.send(200, "application/json", "{\"ok\":true}");
+  else if (state == -2) server.send(409, "application/json", "{\"ok\":false,\"error\":\"Conflicting result\"}");
+  else server.send(503, "application/json", "{\"ok\":false,\"pending\":true}");
 }
 
 static void handleTestDisplay(){
@@ -706,11 +738,19 @@ void setup() {
       startAP();
   }
 
-  initServerClient();
+  initServerClient(STATION_URL);
 
   disco::begin();   // random name (persisted) + UDP discovery, after WiFi is up
 
+  server.on("/api/result", HTTP_POST, handleStationResult);
   server.on("/", HTTP_GET, handleRoot);
+  // Connectivity probes must signal a captive portal, not internet access.
+  server.on("/connecttest.txt", HTTP_GET, handlePortalRedirect);
+  server.on("/ncsi.txt", HTTP_GET, handlePortalRedirect);
+  server.on("/redirect", HTTP_GET, handlePortalRedirect);
+  server.on("/generate_204", HTTP_GET, handlePortalRedirect);
+  server.on("/gen_204", HTTP_GET, handlePortalRedirect);
+  server.on("/hotspot-detect.html", HTTP_GET, handlePortalRedirect);
   server.on("/state", HTTP_GET, handleState);
   server.on("/set", HTTP_GET, handleSet);
   server.on("/overlay", HTTP_GET, handleOverlay);
@@ -733,6 +773,7 @@ void setup() {
 
 void loop() {
   M5.update();
+  pumpButton();
   if (apActive()) dnsServer.processNextRequest();
   server.handleClient();
   pumpSerial();
@@ -748,5 +789,5 @@ void loop() {
     discoveryIP = currentIP;
   }
   if ((uint32_t)currentIP != 0) disco::loop();
-  pumpButton();    // short / long / double click -> the current slot's actions
+  delay(1); // Yield while the network worker handles HTTP.
 }

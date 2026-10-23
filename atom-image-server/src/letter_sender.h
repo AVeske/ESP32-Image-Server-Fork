@@ -9,4 +9,5 @@ enum class LetterTransport { WIFI, SERIAL_PORT };
 static const LetterTransport LETTER_TRANSPORT = LetterTransport::SERIAL_PORT;
 
 // stationUrl is only used with LetterTransport::WIFI.
-bool sendLetter(const String& stationUrl, char letter);
+bool sendLetter(const String& stationUrl, char letter,
+                LetterTransport transport = LETTER_TRANSPORT, int jobId = -1);
