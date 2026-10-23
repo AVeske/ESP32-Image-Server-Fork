@@ -32,6 +32,8 @@
 #include "letter_sender.h"
 #include <HTTPClient.h>
 
+#include "secrets.h"
+
 static const uint16_t FRAME_W = 128;
 static const uint16_t FRAME_H = 128;
 static const size_t   FRAME_BYTES = (size_t)FRAME_W * FRAME_H * 2;  // 32768
