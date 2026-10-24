@@ -75,3 +75,27 @@ static const char* AP_PASS = "atomframer";   // >= 8 chars, or "" for an open AP
 - The framer page can `EXPORT .DAT` (raw 32 768-byte RGB565) or `SAVE PNG + DATA`
   (a normal PNG with the raw RGB565 in a private `daTa` chunk) and load either
   back in later.
+
+## Post-office PNG jobs
+
+The Flask page uploads and stores PNG images and sends this poll response:
+
+```json
+{"msg":17,"job":"show_image","arg":"<64-character image id>","image_url":"/api/images/<id>/png"}
+```
+
+The Atom downloads the PNG from the configured SERVER_URL with X-API-Key,
+retries download failures up to three times, and decodes the 128x128 PNG on
+the main loop. It reports done only after display, or error on failure.
+Final results use the existing retry queue if the public server is unavailable.
+Downloads are limited to 64 KiB and same-server image paths; redirects are disabled.
+Local image slots are preserved; the remote image itself is not saved across reboot.
+Button letter selection and station letter forwarding remain available.
+
+TLS currently follows the existing poll/result implementation (setInsecure):
+the server certificate is not verified. Configure a trusted CA before considering
+the lab HTTPS identity-verification requirement complete.
+
+Hardware check: upload a PNG on Flask, send show_image, observe it on the Atom,
+and verify done on the page. Also test invalid image IDs, disconnect during download,
+and reconnect after display to confirm result retries.

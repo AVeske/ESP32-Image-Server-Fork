@@ -34,7 +34,10 @@
 
 #include "server_client.h"
 #include <ArduinoJson.h>
+// Keep header-defined configuration local to this translation unit.
+namespace {
 #include "secrets.h"
+}
 
 static const uint16_t FRAME_W = 128;
 static const uint16_t FRAME_H = 128;
@@ -103,6 +106,34 @@ static void pushFrame() {
   M5.Display.pushImage(0, 0, FRAME_W, FRAME_H, (const m5gfx::swap565_t*)frameBuf);
   M5.Display.endWrite();
   overlay::draw(M5.Display);   // labels/bars sit on top of the image
+}
+
+// Called only from the main loop, never from the network worker.
+static bool displayServerPng(const uint8_t* png, size_t length) {
+  Serial.printf("PNG decode: bytes=%u heap=%u largest=%u\n",
+                (unsigned)length, (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getMaxAllocHeap());
+  M5Canvas image(&M5.Display);
+  // The existing frame is already a 128x128 big-endian RGB565 buffer.
+  // Attach it instead of allocating a second 32 KiB framebuffer.
+  image.setBuffer(frameBuf, FRAME_W, FRAME_H, 16);
+  image.fillScreen(TFT_BLACK);
+  bool decoded = image.drawPng(png, length, 0, 0);
+  image.deleteSprite(); // Detaches the externally owned buffer without freeing it.
+  M5.Display.releasePngMemory();
+  if (!decoded) {
+    Serial.printf("PNG decoder rejected image: bytes=%u heap=%u largest=%u\n",
+                  (unsigned)length, (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMaxAllocHeap());
+    frameOk = false;
+    return false;
+  }
+  letterMode = false;
+  markerId = -1;
+  frameOk = true;
+  pushFrame();
+  // Remote jobs do not overwrite any of the four locally saved slots.
+  return true;
 }
 
 static String midKey(int n) { return "mid" + String(n); }
@@ -738,6 +769,7 @@ void setup() {
       startAP();
   }
 
+  setServerImageHandler(displayServerPng);
   initServerClient(STATION_URL);
 
   disco::begin();   // random name (persisted) + UDP discovery, after WiFi is up

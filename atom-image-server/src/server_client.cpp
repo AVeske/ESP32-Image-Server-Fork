@@ -6,7 +6,10 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
+// Keep header-defined configuration local to this translation unit.
+namespace {
 #include "secrets.h"
+}
 #include "letter_sender.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -16,6 +19,89 @@
 static String stationUrl;
 static unsigned long lastPollAt = 0;
 static QueueHandle_t manualLetters = nullptr;
+struct DownloadedImage { int id; uint8_t* data; size_t length; };
+static QueueHandle_t imageQueue = nullptr;
+static ServerImageHandler imageHandler = nullptr;
+void setServerImageHandler(ServerImageHandler handler) { imageHandler = handler; }
+
+// Bounded sink also supports HTTP chunked transfer without growing a String.
+class PngBuffer : public Stream {
+public:
+    uint8_t* data = nullptr;
+    size_t length = 0;
+    bool overflow = false;
+    static constexpr size_t capacity = 65536;
+    PngBuffer() { data = static_cast<uint8_t*>(malloc(capacity)); }
+    ~PngBuffer() { free(data); }
+    size_t write(uint8_t value) override { return write(&value, 1); }
+    size_t write(const uint8_t* bytes, size_t count) override {
+        if (!data || count > capacity - length) { overflow = true; return 0; }
+        memcpy(data + length, bytes, count);
+        length += count;
+        return count;
+    }
+    int available() override { return 0; }
+    int read() override { return -1; }
+    int peek() override { return -1; }
+    void flush() override {}
+};
+
+static bool queueRemoteImage(int id, const String& imageId, const String& path) {
+    // Never send the API key to an arbitrary URL supplied in a job.
+    if (imageId.length() != 64) return false;
+    for (size_t i = 0; i < imageId.length(); ++i) {
+        char c = imageId[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    if (path != String("/api/images/") + imageId + "/png") return false;
+    String base = SERVER_URL;
+    while (base.endsWith("/")) base.remove(base.length() - 1);
+    if (!base.startsWith("https://")) return false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        PngBuffer buffer;
+        if (!buffer.data) return false;
+        WiFiClientSecure client;
+        // Same TLS configuration as the existing poll/result client.
+        client.setInsecure();
+        HTTPClient http;
+        http.setConnectTimeout(2000);
+        http.setTimeout(5000);
+        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        bool ok = false;
+        if (http.begin(client, base + path)) {
+            http.addHeader("X-API-Key", ATOM_API_KEY);
+            int code = http.GET();
+            int expected = http.getSize();
+            if (code == 200 && (expected == -1 || (expected > 0 && expected <= 65536))) {
+                int written = http.writeToStream(&buffer);
+                const uint8_t signature[] = {137, 80, 78, 71, 13, 10, 26, 10};
+                const uint8_t dimensions[] = {0, 0, 0, 128, 0, 0, 0, 128};
+                ok = written > 0 && !buffer.overflow && buffer.length >= 24 &&
+                     (expected < 0 || buffer.length == static_cast<size_t>(expected)) &&
+                     memcmp(buffer.data, signature, 8) == 0 &&
+                     memcmp(buffer.data + 12, "IHDR", 4) == 0 &&
+                     memcmp(buffer.data + 16, dimensions, 8) == 0;
+            }
+            http.end();
+        }
+        // Release TLS buffers before the main loop starts the PNG decoder.
+        client.stop();
+        if (ok) {
+            uint8_t* compact = static_cast<uint8_t*>(realloc(buffer.data, buffer.length));
+            if (compact) buffer.data = compact;
+            Serial.printf("PNG downloaded: bytes=%u heap=%u largest=%u\n",
+                          (unsigned)buffer.length, (unsigned)ESP.getFreeHeap(),
+                          (unsigned)ESP.getMaxAllocHeap());
+            DownloadedImage image{id, buffer.data, buffer.length};
+            if (xQueueSend(imageQueue, &image, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+            buffer.data = nullptr; // Main loop now owns and frees the PNG.
+            return true;
+        }
+        Serial.printf("Image download failed: job=%d attempt=%d\n", id, attempt + 1);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    return false;
+}
 static SemaphoreHandle_t resultLock = nullptr;
 static bool workerReady = false;
 static void serverWorker(void*);
@@ -87,8 +173,9 @@ void initServerClient(const char* configuredStationUrl) {
     lastPollAt = millis();
     lastNetworkLogAt = millis();
     manualLetters = xQueueCreate(16, sizeof(char));
+    imageQueue = xQueueCreate(2, sizeof(DownloadedImage));
     resultLock = xSemaphoreCreateMutex();
-    if (!manualLetters || !resultLock) {
+    if (!manualLetters || !resultLock || !imageQueue) {
         Serial.println("ERROR: could not initialize network worker");
         return;
     }
@@ -131,6 +218,13 @@ static bool sendJobResult(int messageId, const char* result) {
 }
 
 void pollServer() {
+    DownloadedImage image;
+    if (workerReady && xQueueReceive(imageQueue, &image, 0) == pdTRUE) {
+        bool displayed = imageHandler && imageHandler(image.data, image.length);
+        free(image.data);
+        queueStationResult(image.id, displayed ? "done" : "error");
+        Serial.printf("Image job %d: %s\n", image.id, displayed ? "displayed" : "decode failed");
+    }
     // Independent of the poll interval, including while WiFi is disconnected.
     unsigned long now = millis();
     if (now - lastNetworkLogAt >= NETWORK_LOG_INTERVAL_MS) {
@@ -188,6 +282,13 @@ static void pollServerOnce() {
     const char* argument = doc["arg"] | "";
     Serial.printf("Job received: id=%d, type=%s, argument=%s\n",
                   messageId, job, argument);
+    if (strcmp(job, "show_image") == 0) {
+        const char* path = doc["image_url"] | "";
+        if (!queueRemoteImage(messageId, String(argument), String(path))) {
+            queueStationResult(messageId, "error");
+        }
+        return;
+    }
     if (strcmp(job, "letter") != 0) {
         Serial.printf("Job not implemented yet: %s\n", job);
         queueStationResult(messageId, "refused");
