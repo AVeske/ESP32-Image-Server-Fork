@@ -183,14 +183,6 @@ bool connectWiFi() {
     Serial.println("===== WIFI =====");
     Serial.printf("Connecting to: %s\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
-    // Fixed address on the AtomFramer network.
-    const IPAddress cameraIP(192, 168, 4, 5);
-    const IPAddress gateway(192, 168, 4, 1);
-    const IPAddress subnet(255, 255, 255, 0);
-    if (!WiFi.config(cameraIP, gateway, subnet)) {
-        Serial.println("ERROR: Static camera IP configuration failed");
-        return false;
-    }
 
     // ESP camera stream võib WiFi power-savinguga hakata jõnksutama.
     WiFi.setSleep(false);
